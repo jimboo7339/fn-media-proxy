@@ -1,0 +1,13 @@
+services:
+  fn-media-proxy:
+    build: .
+    # 或使用预构建镜像：image: ghcr.io/<you>/fn-media-proxy:latest
+    container_name: fn-media-proxy
+    restart: unless-stopped
+    ports:
+      - "8096:8096"
+    environment:
+      # 飞牛影视服务地址。容器内访问 NAS 本机可用 host.docker.internal 或直接用局域网 IP
+      FN_BASE: "http://192.168.100.10:8005"
+      SERVER_NAME: "fnOS Media"
+      LISTEN: ":8096"

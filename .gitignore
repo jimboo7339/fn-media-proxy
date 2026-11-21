@@ -1,0 +1,15 @@
+# 构建产物
+bin/
+dist/
+*.exe
+*.zip
+
+# 探测/测试临时文件
+tools/probe/stream_full.json
+tools/probe/__pycache__/
+*.pyc
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store

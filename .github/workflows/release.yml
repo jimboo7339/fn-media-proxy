@@ -1,0 +1,184 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ---- 1. 静态检查与构建 ----
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: build
+        run: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/fn-media-proxy ./cmd/fn-media-proxy
+
+      - name: smoke (self-test, no NAS required)
+        run: |
+          set -e
+          ./dist/fn-media-proxy -listen :18096 -fn http://127.0.0.1:1 &
+          PID=$!
+          sleep 2
+          # 服务必须能启动并响应公共接口（不依赖飞牛在线）
+          curl -fsS http://127.0.0.1:18096/System/Info/Public | tee /tmp/info.json
+          grep -q '"ServerName"' /tmp/info.json
+          kill $PID
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fn-media-proxy-linux-amd64
+          path: dist/fn-media-proxy
+
+  # ---- 2. 交叉编译多架构二进制（打 tag 时）----
+  binaries:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w" \
+            -o "dist/fn-media-proxy-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}" \
+            ./cmd/fn-media-proxy
+          cd dist && sha256sum * > SHA256SUMS-${{ matrix.goos }}-${{ matrix.goarch }}.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+
+  # ---- 3. Docker 镜像（多架构）----
+  docker:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: login ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---- 4. 发布 Release（打 tag 时）----
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [binaries, docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: list artifacts
+        run: ls -laR artifacts
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          body: |
+            ## 安装
+
+            ### 方式一：Docker（推荐）
+
+            ```bash
+            docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            docker run -d --name fn-media-proxy --restart unless-stopped \
+              -p 8096:8096 \
+              -e FN_BASE=http://<你的飞牛IP>:8005 \
+              ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ```
+
+            ### 方式二：二进制
+
+            下载对应平台的 `fn-media-proxy-*`，赋予执行权限后直接运行：
+
+            ```bash
+            FN_BASE=http://<你的飞牛IP>:8005 ./fn-media-proxy-linux-amd64 -listen :8096
+            ```
+
+            ## 在播放器里连接
+
+            服务器地址 `http://<运行网关的机器>:8096`，账号密码用飞牛影视的。
+
+            详见 [README](https://github.com/${{ github.repository }}#readme)。
